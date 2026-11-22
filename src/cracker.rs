@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use crate::bedrock::BedrockObservation;
 use crate::decorator::{DecoratorKind, DecoratorObservation};
 use crate::finders::{FinderKind, Yields};
 use crate::hash;
@@ -157,6 +158,7 @@ pub struct Cracker {
     structures: Vec<StructureObservation>,
     checks: Vec<Check>,
     decorators: Vec<DecoratorObservation>,
+    bedrock: Vec<BedrockObservation>,
     pillars: Option<PillarObservation>,
     hashed: Option<i64>,
     hash_failed: bool,
@@ -178,6 +180,7 @@ impl Cracker {
             structures: Vec::new(),
             checks: Vec::new(),
             decorators: Vec::new(),
+            bedrock: Vec::new(),
             pillars: None,
             hashed: None,
             hash_failed: false,
@@ -216,6 +219,14 @@ impl Cracker {
                     false
                 } else {
                     self.decorators.push(d);
+                    true
+                }
+            }
+            Observation::Bedrock(b) => {
+                if self.bedrock.contains(&b) {
+                    false
+                } else {
+                    self.bedrock.push(b);
                     true
                 }
             }
@@ -278,6 +289,10 @@ impl Cracker {
         &self.decorators
     }
 
+    pub fn bedrock(&self) -> &[BedrockObservation] {
+        &self.bedrock
+    }
+
     pub fn pillars(&self) -> Option<&PillarObservation> {
         self.pillars.as_ref()
     }
@@ -315,6 +330,10 @@ impl Cracker {
 
     pub fn decorator_bits(&self) -> f64 {
         self.decorators.iter().map(|d| d.bits(self.range)).sum()
+    }
+
+    pub fn bedrock_bits(&self) -> f64 {
+        self.bedrock.iter().map(BedrockObservation::bits).sum()
     }
 
     pub fn stage(&self) -> Stage {
@@ -364,6 +383,7 @@ impl Cracker {
             structures: self.structures.clone(),
             checks: self.checks.clone(),
             decorators: self.decorators.clone(),
+            bedrock: self.bedrock.clone(),
             range: self.range,
         })
     }
@@ -444,11 +464,11 @@ impl Cracker {
     }
 
     fn test_world_seed(&self, seed: i64, rand: &mut WorldgenRandom) -> bool {
-        self.decorators.iter().all(|d| d.test(seed, self.range, rand))
+        self.decorators.iter().all(|d| d.test(seed, self.range, rand)) && self.bedrock.iter().all(|b| b.test(seed, rand))
     }
 
     fn scan(&self, kind: &JobKind, range: Range<u64>, out: &mut Vec<i64>) {
-        scan(kind, &self.checks, &self.decorators, self.range, range, out);
+        scan(kind, &self.checks, &self.decorators, &self.bedrock, self.range, range, out);
     }
 
     fn finish(&mut self, job: Job) {
@@ -555,7 +575,8 @@ impl Cracker {
             return;
         }
         let wanted = 16.0 + (structures.len() as f64).log2() + DECORATOR_MARGIN;
-        if !self.decorators.is_empty() && self.decorator_bits() >= wanted {
+        let has_sightings = !self.decorators.is_empty() || !self.bedrock.is_empty();
+        if has_sightings && self.decorator_bits() + self.bedrock_bits() >= wanted {
             self.start(JobKind::WorldByDecorators { structures });
         }
     }
@@ -632,7 +653,7 @@ impl Cracker {
             }
         }
         if let Some(worlds) = &self.world_seeds {
-            if worlds.len() > 1 && !self.decorators.is_empty() {
+            if worlds.len() > 1 && (!self.decorators.is_empty() || !self.bedrock.is_empty()) {
                 let mut rand = WorldgenRandom::new();
                 let kept: Vec<i64> = worlds.iter().copied().filter(|&w| self.test_world_seed(w, &mut rand)).collect();
                 if !kept.is_empty() && kept.len() != worlds.len() {
@@ -647,6 +668,7 @@ fn scan(
     kind: &JobKind,
     checks: &[Check],
     decorators: &[DecoratorObservation],
+    bedrock: &[BedrockObservation],
     gen_range: GenRange,
     range: Range<u64>,
     out: &mut Vec<i64>,
@@ -693,7 +715,9 @@ fn scan(
             let mut rand = WorldgenRandom::new();
             for k in range {
                 let w = hash::with_upper(structures[(k >> 16) as usize], k as u16);
-                if decorators.iter().all(|d| d.test(w, gen_range, &mut rand)) {
+                if decorators.iter().all(|d| d.test(w, gen_range, &mut rand))
+                    && bedrock.iter().all(|b| b.test(w, &mut rand))
+                {
                     out.push(w);
                 }
             }
@@ -714,6 +738,7 @@ pub struct Task {
     structures: Vec<StructureObservation>,
     checks: Vec<Check>,
     decorators: Vec<DecoratorObservation>,
+    bedrock: Vec<BedrockObservation>,
     range: GenRange,
 }
 
@@ -728,7 +753,7 @@ impl Task {
 
     pub fn scan(&self, range: Range<u64>) -> Vec<i64> {
         let mut out = Vec::new();
-        scan(&self.kind, &self.checks, &self.decorators, self.range, range, &mut out);
+        scan(&self.kind, &self.checks, &self.decorators, &self.bedrock, self.range, range, &mut out);
         out
     }
 
@@ -781,6 +806,13 @@ impl Task {
                 w.extend_from_slice(&v.to_le_bytes());
             }
         }
+        w.extend_from_slice(&(self.bedrock.len() as u32).to_le_bytes());
+        for b in &self.bedrock {
+            for v in [b.x, b.y, b.z, b.min_y, b.max_y] {
+                w.extend_from_slice(&v.to_le_bytes());
+            }
+            w.push(b.present as u8);
+        }
         w
     }
 
@@ -819,9 +851,16 @@ impl Task {
                 Some(DecoratorObservation { kind, x, y, z, height_above_surface: (h != i32::MIN).then_some(h) })
             })
             .collect::<Option<_>>()?;
+        let bedrock: Vec<BedrockObservation> = (0..r.u32()?)
+            .map(|_| {
+                let (x, y, z, min_y, max_y) = (r.i32()?, r.i32()?, r.i32()?, r.i32()?, r.i32()?);
+                let present = r.u8()? != 0;
+                Some(BedrockObservation { x, y, z, min_y, max_y, present })
+            })
+            .collect::<Option<_>>()?;
         let mut checks: Vec<Check> = structures.iter().map(Check::new).collect();
         checks.sort_by(|a, b| b.bits.total_cmp(&a.bits));
-        Some(Task { id, kind, structures, checks, decorators, range })
+        Some(Task { id, kind, structures, checks, decorators, bedrock, range })
     }
 }
 

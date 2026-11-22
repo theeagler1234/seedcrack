@@ -1,3 +1,4 @@
+pub mod bedrock;
 pub mod cracker;
 pub mod decorator;
 pub mod finders;
@@ -12,6 +13,7 @@ pub mod xoroshiro;
 #[cfg(test)]
 mod tests;
 
+pub use bedrock::BedrockObservation;
 pub use cracker::{Cracker, Event, Hint, Slice, Stage, Task};
 pub use decorator::{DecoratorKind, DecoratorObservation};
 pub use finders::{FinderKind, Yields, scan_chunk};
